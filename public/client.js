@@ -6,8 +6,12 @@ const roomInput = document.getElementById('room-input');
 const passwordInput = document.getElementById('password-input');
 const joinBtn = document.getElementById('join-btn');
 const roomsListEl = document.getElementById('rooms-list');
+const micBtn = document.getElementById('mic-btn');
 const shareBtn = document.getElementById('share-btn');
 const stopShareBtn = document.getElementById('stop-share-btn');
+const participantsList = document.getElementById('participants-list');
+const participantsCount = document.getElementById('participants-count');
+const voiceAudioSink = document.getElementById('voice-audio-sink');
 const leaveBtn = document.getElementById('leave-btn');
 const statusDot = document.getElementById('status-dot');
 const statusText = document.getElementById('status-text');
@@ -31,15 +35,32 @@ let pendingJoin = false; // true enquanto esperamos o WebSocket abrir pra entrar
 // Nomes de todo mundo na sala (inclusive eu), por id.
 const peerNames = new Map();
 
-// Uma RTCPeerConnection por peer com quem estou falando: se eu estiver
-// apresentando, uma pra cada espectador; se eu estiver assistindo, só uma
-// (com quem está apresentando agora).
-const peerConnections = new Map();
+// Uma RTCPeerConnection de TELA por peer com quem estou falando: se eu
+// estiver apresentando, uma pra cada espectador; se eu estiver assistindo,
+// só uma (com quem está apresentando agora). Separada das conexões de voz
+// porque as duas ligam/desligam em momentos completamente diferentes.
+const screenPeerConnections = new Map();
 
 // Quem está apresentando a sala agora (só uma pessoa por vez).
 let presenterId = null;
 let presenterName = null;
 let remoteStream = null;
+
+// ===== Voice chat (malha de áudio entre todo mundo da sala) =====
+// Uma RTCPeerConnection de VOZ por peer, criada assim que alguém entra na
+// sala (independente de ligar o microfone) — assim dá pra já ouvir quem
+// ligar o microfone depois, sem precisar renegociar a conexão. Cada entrada
+// guarda o "sender" de áudio: ligar/desligar o microfone só troca a track
+// desse sender (RTCRtpSender.replaceTrack), sem nova oferta/resposta.
+const voicePeers = new Map(); // peerId -> { pc, sender, audioEl }
+let micStream = null;
+let micEnabled = false;
+
+// Pra uma malha (todo mundo conecta com todo mundo) sem duplicar conexões,
+// só quem tem o id "menor" inicia a oferta pro outro lado — o outro espera.
+function shouldInitiateVoiceTo(otherPeerId) {
+  return myId < otherPeerId;
+}
 
 // Quem está sendo exibido na única tela disponível agora: 'local', 'remote' ou null.
 let activeSharer = null;
@@ -160,6 +181,30 @@ function renderRoomList(rooms) {
   });
 }
 
+// ===== Lista de participantes da sala (sempre visível, na lateral) =====
+// Quem eu sei que está com o microfone ligado agora (id -> true), a partir
+// dos avisos 'mic-changed' — só pra mostrar o indicador na lista.
+const micActivePeers = new Set();
+
+function renderParticipants() {
+  participantsCount.textContent = peerNames.size;
+
+  if (peerNames.size === 0) {
+    participantsList.innerHTML = '<div class="participants-empty">Ninguém mais por aqui ainda.</div>';
+    return;
+  }
+
+  participantsList.innerHTML = Array.from(peerNames.entries()).map(([id, name]) => {
+    const isPresenting = id === presenterId;
+    const isMicOn = id === myId ? micEnabled : micActivePeers.has(id);
+    const label = id === myId ? `${name} (você)` : name;
+    const cls = isPresenting ? 'participant-item presenting' : 'participant-item';
+    const mic = isMicOn ? '<span title="Microfone ligado">🎤</span>' : '';
+    const badge = isPresenting ? '<span class="participant-badge">apresentando</span>' : '';
+    return `<div class="${cls}"><span>${escapeHtml(label)}</span>${mic}${badge}</div>`;
+  }).join('');
+}
+
 // ===== Tela cheia =====
 // Qualquer um dos dois (quem compartilha ou quem assiste) pode expandir
 // o vídeo pra tela cheia usando a Fullscreen API nativa do navegador.
@@ -221,15 +266,15 @@ function updateShareControls() {
   }
 }
 
-// ===== Conexões WebRTC (uma por peer) =====
-function createPeerConnection(peerId) {
+// ===== Conexões WebRTC de tela (uma por peer) =====
+function createScreenPeerConnection(peerId) {
   const connection = new RTCPeerConnection(iceServersConfig);
 
   // Sempre que o navegador encontra um novo "caminho de rede" possível
   // (candidate), manda pro peer correspondente via WebSocket.
   connection.onicecandidate = (event) => {
     if (event.candidate) {
-      ws.send(JSON.stringify({ type: 'ice-candidate', candidate: event.candidate, target: peerId }));
+      ws.send(JSON.stringify({ type: 'ice-candidate', purpose: 'screen', candidate: event.candidate, target: peerId }));
     }
   };
 
@@ -243,24 +288,24 @@ function createPeerConnection(peerId) {
   };
 
   connection.onconnectionstatechange = () => {
-    console.log(`Estado da conexão WebRTC com ${peerId}:`, connection.connectionState);
+    console.log(`Estado da conexão de TELA com ${peerId}:`, connection.connectionState);
   };
 
-  peerConnections.set(peerId, connection);
+  screenPeerConnections.set(peerId, connection);
   return connection;
 }
 
-function closePeerConnection(peerId) {
-  const connection = peerConnections.get(peerId);
+function closeScreenPeerConnection(peerId) {
+  const connection = screenPeerConnections.get(peerId);
   if (connection) {
     connection.close();
-    peerConnections.delete(peerId);
+    screenPeerConnections.delete(peerId);
   }
 }
 
-function closeAllPeerConnections() {
-  peerConnections.forEach((connection) => connection.close());
-  peerConnections.clear();
+function closeAllScreenPeerConnections() {
+  screenPeerConnections.forEach((connection) => connection.close());
+  screenPeerConnections.clear();
 }
 
 // ===== Cancelamento de ruído do áudio compartilhado =====
@@ -316,17 +361,134 @@ function getOutgoingTracks() {
   return tracks;
 }
 
-// Cria uma conexão + oferta dedicada pra um espectador específico.
+// Cria uma conexão + oferta de TELA dedicada pra um espectador específico.
 // Usada quando eu começo a apresentar e quando alguém novo entra na sala
 // enquanto eu já estou apresentando.
-async function offerTo(peerId) {
-  closePeerConnection(peerId);
-  const pc = createPeerConnection(peerId);
+async function offerScreenTo(peerId) {
+  closeScreenPeerConnection(peerId);
+  const pc = createScreenPeerConnection(peerId);
   getOutgoingTracks().forEach((track) => pc.addTrack(track, localStream));
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
-  ws.send(JSON.stringify({ type: 'offer', offer, target: peerId }));
+  ws.send(JSON.stringify({ type: 'offer', purpose: 'screen', offer, target: peerId }));
 }
+
+// ===== Conexões WebRTC de voz (malha entre todo mundo) =====
+// Cria (sem oferecer ainda) a conexão de voz com um peer: monta o
+// transceiver de áudio bidirecional, o elemento <audio> que vai tocar o que
+// a gente receber dele, e guarda tudo em voicePeers.
+function setupVoicePeerConnection(peerId) {
+  const pc = new RTCPeerConnection(iceServersConfig);
+
+  pc.onicecandidate = (event) => {
+    if (event.candidate) {
+      ws.send(JSON.stringify({ type: 'ice-candidate', purpose: 'voice', candidate: event.candidate, target: peerId }));
+    }
+  };
+
+  pc.ontrack = (event) => {
+    let audioEl = voicePeers.get(peerId)?.audioEl;
+    if (!audioEl) {
+      audioEl = document.createElement('audio');
+      audioEl.autoplay = true;
+      voiceAudioSink.appendChild(audioEl);
+    }
+    audioEl.srcObject = event.streams[0];
+    const entry = voicePeers.get(peerId);
+    if (entry) entry.audioEl = audioEl;
+  };
+
+  pc.onconnectionstatechange = () => {
+    console.log(`Estado da conexão de VOZ com ${peerId}:`, pc.connectionState);
+  };
+
+  voicePeers.set(peerId, { pc, sender: null, audioEl: null });
+  return pc;
+}
+
+// Eu inicio a conexão de voz com esse peer (sou o lado com id "menor").
+async function offerVoiceTo(peerId) {
+  const pc = setupVoicePeerConnection(peerId);
+  const transceiver = pc.addTransceiver('audio', { direction: 'sendrecv' });
+  voicePeers.get(peerId).sender = transceiver.sender;
+  if (micStream) {
+    await transceiver.sender.replaceTrack(micStream.getAudioTracks()[0]);
+  }
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  ws.send(JSON.stringify({ type: 'offer', purpose: 'voice', offer, target: peerId }));
+}
+
+// Recebi uma oferta de voz de alguém com id "menor" que o meu — respondo.
+async function handleVoiceOffer(senderId, offer) {
+  const pc = setupVoicePeerConnection(senderId);
+  await pc.setRemoteDescription(new RTCSessionDescription(offer));
+
+  const transceiver = pc.getTransceivers()[0];
+  voicePeers.get(senderId).sender = transceiver.sender;
+  if (micStream) {
+    await transceiver.sender.replaceTrack(micStream.getAudioTracks()[0]);
+  }
+
+  const answer = await pc.createAnswer();
+  await pc.setLocalDescription(answer);
+  ws.send(JSON.stringify({ type: 'answer', purpose: 'voice', answer, target: senderId }));
+}
+
+function closeVoicePeer(peerId) {
+  const entry = voicePeers.get(peerId);
+  if (!entry) return;
+  entry.pc.close();
+  if (entry.audioEl) {
+    entry.audioEl.srcObject = null;
+    entry.audioEl.remove();
+  }
+  voicePeers.delete(peerId);
+}
+
+function closeAllVoicePeers() {
+  Array.from(voicePeers.keys()).forEach(closeVoicePeer);
+}
+
+// Liga/desliga meu microfone em TODAS as conexões de voz já abertas, sem
+// precisar renegociar nenhuma delas (RTCRtpSender.replaceTrack).
+function updateMicButton() {
+  micBtn.classList.toggle('active', micEnabled);
+  micBtn.textContent = micEnabled ? '🎤 Desativar microfone' : '🎤 Ativar microfone';
+}
+
+micBtn.addEventListener('click', async () => {
+  if (micEnabled) {
+    micEnabled = false;
+    if (micStream) {
+      micStream.getTracks().forEach((track) => track.stop());
+      micStream = null;
+    }
+    voicePeers.forEach(({ sender }) => sender && sender.replaceTrack(null));
+    updateMicButton();
+    renderParticipants();
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'mic-changed', enabled: false }));
+    }
+    return;
+  }
+
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+    });
+    micEnabled = true;
+    const micTrack = micStream.getAudioTracks()[0];
+    voicePeers.forEach(({ sender }) => sender && sender.replaceTrack(micTrack));
+    updateMicButton();
+    renderParticipants();
+    ws.send(JSON.stringify({ type: 'mic-changed', enabled: true }));
+  } catch (err) {
+    console.error('Erro ao ativar microfone:', err);
+    alert('Não foi possível acessar o microfone.');
+  }
+});
 
 // ===== Tratamento das mensagens de sinalização vindas do servidor =====
 async function handleSignal(msg) {
@@ -350,6 +512,12 @@ async function handleSignal(msg) {
       setStatus(true, `Conectado à sala "${roomCode}"`);
       updateShareControls();
       renderScreen();
+      renderParticipants();
+      // Conecta a malha de voz com quem já estava na sala (só quem tem o id
+      // "menor" inicia, o outro lado responde quando a oferta chegar).
+      Array.from(peerNames.keys())
+        .filter((id) => id !== myId && shouldInitiateVoiceTo(id))
+        .forEach((id) => offerVoiceTo(id));
       break;
 
     case 'join-denied':
@@ -364,17 +532,27 @@ async function handleSignal(msg) {
 
     case 'peer-joined':
       peerNames.set(msg.id, msg.name);
+      renderParticipants();
       // Se eu já estou apresentando, essa pessoa não recebeu a oferta
       // original (ela só é enviada pra quem já estava na sala). Então
       // abrimos uma conexão dedicada pra ela também poder ver a transmissão.
       if (activeSharer === 'local' && localStream) {
-        offerTo(msg.id);
+        offerScreenTo(msg.id);
+      }
+      // O mesmo vale pra voz: se eu tenho o id "menor", inicio a conexão
+      // com quem acabou de chegar (ela vai me ouvir e eu vou ouvi-la assim
+      // que algum dos dois ligar o microfone).
+      if (shouldInitiateVoiceTo(msg.id)) {
+        offerVoiceTo(msg.id);
       }
       break;
 
     case 'peer-left':
       peerNames.delete(msg.id);
-      closePeerConnection(msg.id);
+      closeScreenPeerConnection(msg.id);
+      closeVoicePeer(msg.id);
+      micActivePeers.delete(msg.id);
+      renderParticipants();
       break;
 
     case 'presenter-changed':
@@ -387,7 +565,7 @@ async function handleSignal(msg) {
           activeSharer = 'local';
           renderScreen();
           const otherPeerIds = Array.from(peerNames.keys()).filter((id) => id !== myId);
-          otherPeerIds.forEach((id) => offerTo(id));
+          otherPeerIds.forEach((id) => offerScreenTo(id));
         } else {
           screenHintText = `${presenterName} está compartilhando a tela. Conectando...`;
         }
@@ -395,7 +573,7 @@ async function handleSignal(msg) {
         // O apresentador parou (ou saiu da sala).
         const whoStopped = presenterId === myId ? 'Você' : (presenterName || 'A outra pessoa');
         if (presenterId && presenterId !== myId) {
-          closePeerConnection(presenterId);
+          closeScreenPeerConnection(presenterId);
           remoteStream = null;
         }
         presenterId = null;
@@ -407,25 +585,37 @@ async function handleSignal(msg) {
         renderScreen();
       }
       updateShareControls();
+      renderParticipants();
       break;
 
     case 'offer': {
-      const pc = createPeerConnection(msg.senderId);
+      if (msg.purpose === 'voice') {
+        await handleVoiceOffer(msg.senderId, msg.offer);
+        break;
+      }
+      const pc = createScreenPeerConnection(msg.senderId);
       await pc.setRemoteDescription(new RTCSessionDescription(msg.offer));
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
-      ws.send(JSON.stringify({ type: 'answer', answer, target: msg.senderId }));
+      ws.send(JSON.stringify({ type: 'answer', purpose: 'screen', answer, target: msg.senderId }));
       break;
     }
 
     case 'answer': {
-      const pc = peerConnections.get(msg.senderId);
+      if (msg.purpose === 'voice') {
+        const entry = voicePeers.get(msg.senderId);
+        if (entry) await entry.pc.setRemoteDescription(new RTCSessionDescription(msg.answer));
+        break;
+      }
+      const pc = screenPeerConnections.get(msg.senderId);
       if (pc) await pc.setRemoteDescription(new RTCSessionDescription(msg.answer));
       break;
     }
 
     case 'ice-candidate': {
-      const pc = peerConnections.get(msg.senderId);
+      const pc = msg.purpose === 'voice'
+        ? voicePeers.get(msg.senderId)?.pc
+        : screenPeerConnections.get(msg.senderId);
       if (pc) {
         try {
           await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
@@ -435,6 +625,15 @@ async function handleSignal(msg) {
       }
       break;
     }
+
+    case 'mic-changed':
+      if (msg.enabled) {
+        micActivePeers.add(msg.id);
+      } else {
+        micActivePeers.delete(msg.id);
+      }
+      renderParticipants();
+      break;
 
     case 'presenting-denied':
       if (localStream) {
@@ -496,7 +695,7 @@ function stopSharing() {
     localStream = null;
   }
   teardownNoiseSuppression();
-  closeAllPeerConnections();
+  closeAllScreenPeerConnections();
 
   // Não mexemos em presenterId/activeSharer/hint aqui: o servidor ecoa
   // 'presenter-changed' (com presenterId: null) de volta pra gente também,
@@ -511,7 +710,18 @@ function stopSharing() {
 // ===== Sair da sala =====
 leaveBtn.addEventListener('click', () => {
   stopSharing();
-  closeAllPeerConnections();
+  closeAllScreenPeerConnections();
+
+  // Desliga o microfone e derruba toda a malha de voz.
+  if (micStream) {
+    micStream.getTracks().forEach((track) => track.stop());
+    micStream = null;
+  }
+  micEnabled = false;
+  updateMicButton();
+  closeAllVoicePeers();
+  micActivePeers.clear();
+
   // Fecha e reabre o WebSocket pra voltar ao modo "lobby" (recebendo
   // a lista de salas de novo), em vez de deixar sem conexão nenhuma.
   if (ws) {
@@ -526,6 +736,7 @@ leaveBtn.addEventListener('click', () => {
   passwordInput.value = '';
   myPassword = '';
   peerNames.clear();
+  renderParticipants();
   myId = null;
   presenterId = null;
   presenterName = null;

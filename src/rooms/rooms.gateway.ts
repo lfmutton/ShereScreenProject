@@ -4,7 +4,7 @@ import WebSocket from 'ws';
 import { OnGatewayConnection, OnGatewayDisconnect, WebSocketGateway } from '@nestjs/websockets';
 import { RateLimiterService } from '../rate-limiter/rate-limiter.service';
 import { RoomsService } from './rooms.service';
-import { ClientMessage, PeerInfo, RelayMessage } from './rooms.types';
+import { ClientMessage, MicChangedMessage, PeerInfo, RelayMessage } from './rooms.types';
 
 interface SocketMeta {
   room: string;
@@ -104,6 +104,9 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
       case 'ice-candidate':
         this.relay(msg, meta);
         break;
+      case 'mic-changed':
+        this.handleMicChanged(msg, meta);
+        break;
     }
   }
 
@@ -158,6 +161,16 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     if (this.roomsService.clearPresenterIfSelf(meta.room, meta.peerId)) {
       this.broadcastToRoom(meta.room, { type: 'presenter-changed', presenterId: null });
     }
+  }
+
+  // Avisa o resto da sala que esse peer ligou/desligou o microfone — usado
+  // só pra atualizar a lista de participantes, não afeta a sinalização WebRTC.
+  private handleMicChanged(msg: MicChangedMessage, meta: SocketMeta): void {
+    this.broadcastToRoom(
+      meta.room,
+      { type: 'mic-changed', id: meta.peerId, enabled: msg.enabled },
+      meta.peerId,
+    );
   }
 
   // Sinalização ponto a ponto: repassa a mensagem só pro peer de destino

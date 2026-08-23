@@ -17,18 +17,28 @@ export interface PresentingStopMessage {
 }
 
 // offer/answer/ice-candidate: o servidor só repassa esse payload pro peer
-// de destino (msg.target), sem interpretar o conteúdo (SDP/candidate).
+// de destino (msg.target), sem interpretar o conteúdo (SDP/candidate). O
+// campo "purpose" (screen ou voice) diz pro cliente qual conjunto de
+// RTCPeerConnection usar — o servidor não olha pra ele, só repassa.
 export interface RelayMessage {
   type: 'offer' | 'answer' | 'ice-candidate';
   target: string;
   [key: string]: unknown;
 }
 
+// Avisa o resto da sala que liguei/desliguei o microfone (pra mostrar quem
+// está com voz ativa na lista de participantes).
+export interface MicChangedMessage {
+  type: 'mic-changed';
+  enabled: boolean;
+}
+
 export type ClientMessage =
   | JoinMessage
   | PresentingStartMessage
   | PresentingStopMessage
-  | RelayMessage;
+  | RelayMessage
+  | MicChangedMessage;
 
 export interface PeerInfo {
   id: string;
