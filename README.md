@@ -4,9 +4,18 @@ App simples de compartilhamento de tela entre 2 pessoas, usando WebRTC (conexão
 
 ## Como rodar
 
+Backend em [NestJS](https://nestjs.com/) (TypeScript) + WebSocket (`ws`), frontend estático sem build (`public/`).
+
 ```bash
 cd screen-share-app
 npm install
+npm run start:dev   # desenvolvimento, com recarregamento automático
+```
+
+Ou pra rodar como em produção:
+
+```bash
+npm run build
 npm start
 ```
 
@@ -62,11 +71,17 @@ O servidor limita, por IP: no máximo 30 conexões WebSocket novas por minuto, e
 
 ```
 screen-share-app/
-├── server.js          # Servidor Express + WebSocket (sinalização)
+├── src/                        # Backend (NestJS)
+│   ├── main.ts                 # bootstrap + WsAdapter
+│   ├── app.module.ts
+│   ├── rooms/                  # estado das salas, senha e gateway WebSocket
+│   ├── rate-limiter/           # limite de conexões/mensagens por IP
+│   └── ice-servers/            # GET /ice-servers (STUN + TURN via env)
 ├── package.json
-└── public/
-    ├── index.html      # Interface
-    └── client.js        # Lógica WebRTC + captura de tela
+└── public/                     # Frontend estático (servido pelo Nest)
+    ├── index.html
+    ├── client.js                # Lógica WebRTC + captura de tela
+    └── style.css
 ```
 
 ## Como funciona (resumo)

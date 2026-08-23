@@ -2,12 +2,28 @@
   "name": "screen-share-app",
   "version": "1.0.0",
   "description": "App simples de compartilhamento de tela via WebRTC",
-  "main": "server.js",
+  "main": "dist/main.js",
   "scripts": {
-    "start": "node server.js"
+    "build": "nest build",
+    "start": "node dist/main.js",
+    "start:dev": "nest start --watch"
   },
   "dependencies": {
-    "express": "^4.19.2",
+    "@nestjs/common": "^11.2.1",
+    "@nestjs/config": "^4.0.4",
+    "@nestjs/core": "^11.2.1",
+    "@nestjs/platform-express": "^11.2.1",
+    "@nestjs/platform-ws": "^11.2.1",
+    "@nestjs/serve-static": "^5.0.5",
+    "@nestjs/websockets": "^11.2.1",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.2",
     "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@nestjs/cli": "^11.0.24",
+    "@types/node": "^26.2.0",
+    "@types/ws": "^8.18.1",
+    "typescript": "^6.0.3"
   }
 }
